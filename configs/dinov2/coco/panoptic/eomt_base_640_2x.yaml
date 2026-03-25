@@ -9,6 +9,7 @@ trainer:
 model:
   class_path: training.mask_classification_panoptic.MaskClassificationPanoptic
   init_args:
+    path: /kaggle/input/datasets/awsaf49/coco-2017-dataset
     attn_mask_annealing_enabled: True
     attn_mask_annealing_start_steps: [29564, 73910, 118256]
     attn_mask_annealing_end_steps: [59128, 103474, 147820]
