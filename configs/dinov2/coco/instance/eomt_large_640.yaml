@@ -20,4 +20,4 @@ model:
         encoder:
           class_path: models.vit.ViT
 data:
-  class_path: datasets.coco_instance.COCOInstance
+  class_path: datasets.coco.COCO
