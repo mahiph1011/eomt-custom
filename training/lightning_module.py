@@ -958,55 +958,55 @@ class LightningModule(lightning.LightningModule):
             #     segment_id += 1
 
             # 🔥 USE ALL QUERIES (NO PRUNING)
-        valid = classes_b.ne(class_logits.shape[-1] - 1) & (scores_b > mask_thresh)
-        
-        if not valid.any():
-            preds_list.append(preds)
-            continue
-        
-        # 🔥 SAFE mask scaling
-        masks = (mask_logits_b * 1.1).sigmoid()
-        
-        segments = -torch.ones(
-            *masks.shape[-2:], dtype=torch.long, device=class_logits.device
-        )
-        
-        # 🔥 USE ALL QUERIES (NO slicing)
-        mask_ids = (scores_b[..., None, None] * masks).argmax(0)
-        
-        stuff_segment_ids = {}
-        segment_id = 0
-        segment_and_class_ids = []
-        
-        valid_classes = classes_b[valid]
-        
-        for k, class_id in enumerate(valid_classes.tolist()):
-            orig_mask = masks[valid][k] >= 0.5
-            new_mask = mask_ids == k
-            final_mask = orig_mask & new_mask
-        
-            orig_area = orig_mask.sum().item()
-            new_area = new_mask.sum().item()
-            final_area = final_mask.sum().item()
-        
-            if (
-                orig_area == 0
-                or new_area == 0
-                or final_area == 0
-                or new_area / orig_area < overlap_thresh
-            ):
+            valid = classes_b.ne(class_logits.shape[-1] - 1) & (scores_b > mask_thresh)
+            
+            if not valid.any():
+                preds_list.append(preds)
                 continue
+            
+            # 🔥 SAFE mask scaling
+            masks = (mask_logits_b * 1.1).sigmoid()
+            
+            segments = -torch.ones(
+                *masks.shape[-2:], dtype=torch.long, device=class_logits.device
+            )
+            
+            # 🔥 USE ALL QUERIES (NO slicing)
+            mask_ids = (scores_b[..., None, None] * masks).argmax(0)
         
-            if class_id in stuff_classes:
-                if class_id in stuff_segment_ids:
-                    segments[final_mask] = stuff_segment_ids[class_id]
+            stuff_segment_ids = {}
+            segment_id = 0
+            segment_and_class_ids = []
+            
+            valid_classes = classes_b[valid]
+            
+            for k, class_id in enumerate(valid_classes.tolist()):
+                orig_mask = masks[valid][k] >= 0.5
+                new_mask = mask_ids == k
+                final_mask = orig_mask & new_mask
+            
+                orig_area = orig_mask.sum().item()
+                new_area = new_mask.sum().item()
+                final_area = final_mask.sum().item()
+            
+                if (
+                    orig_area == 0
+                    or new_area == 0
+                    or final_area == 0
+                    or new_area / orig_area < overlap_thresh
+                ):
                     continue
-                else:
-                    stuff_segment_ids[class_id] = segment_id
+            
+                if class_id in stuff_classes:
+                    if class_id in stuff_segment_ids:
+                        segments[final_mask] = stuff_segment_ids[class_id]
+                        continue
+                    else:
+                        stuff_segment_ids[class_id] = segment_id
         
-            segments[final_mask] = segment_id
-            segment_and_class_ids.append((segment_id, class_id))
-            segment_id += 1
+                segments[final_mask] = segment_id
+                segment_and_class_ids.append((segment_id, class_id))
+                segment_id += 1
 
 
 
