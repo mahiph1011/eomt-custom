@@ -817,7 +817,8 @@ class LightningModule(lightning.LightningModule):
     ):
         scores, classes = class_logits.softmax(dim=-1).max(-1)
     
-        print("🔥 PANOPTIC PRUNING ACTIVE")
+        if b == 0:
+            print("🔥 Adaptive pruning enabled")
     
         preds_list = []
     
@@ -829,9 +830,20 @@ class LightningModule(lightning.LightningModule):
             mask_logits_b = mask_logits_list[b]
     
             # 🔥 ONLY MODIFY VALID FILTER (NO TENSOR SLICING)
-            conf_thresh = scores_b.mean().item()
-            valid = (scores_b > conf_thresh)
-    
+            # conf_thresh = scores_b.mean().item()
+            # valid = (scores_b > conf_thresh)
+
+            #  TOP-K + SAFE THRESHOLD
+            topk = 100   # try 80–120 if needed
+            k = min(topk, scores_b.shape[0])
+            
+            topk_scores, topk_idx = torch.topk(scores_b, k)
+            
+            valid = torch.zeros_like(scores_b, dtype=torch.bool)
+            valid[topk_idx] = True
+            
+            # also ensure confidence floor
+            valid = valid & (scores_b > 0.4)
             # fallback
             if valid.sum() == 0:
                 valid = scores_b > 0.3
@@ -851,7 +863,7 @@ class LightningModule(lightning.LightningModule):
                 continue
     
             # 🔥 mask sharpening (SAFE)
-            masks = (mask_logits_b / 0.7).sigmoid()
+            masks = (mask_logits_b / 0.9).sigmoid()
     
             segments = -torch.ones(
                 *masks.shape[-2:], dtype=torch.long, device=class_logits.device
