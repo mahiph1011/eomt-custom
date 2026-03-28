@@ -817,8 +817,8 @@ class LightningModule(lightning.LightningModule):
     ):
         scores, classes = class_logits.softmax(dim=-1).max(-1)
     
-        if b == 0:
-            print("🔥 Adaptive pruning enabled")
+        
+        print("🔥 Adaptive pruning enabled")
     
         preds_list = []
     
