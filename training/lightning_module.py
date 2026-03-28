@@ -839,7 +839,7 @@ class LightningModule(lightning.LightningModule):
             # Step 1: keep top queries (not too aggressive)
             # ===== FINAL BEST SETTINGS =====
 
-            topk = 180   # 🔥 increase coverage
+            topk = 200  # 🔥 increase coverage
             k = min(topk, scores_b.shape[0])
             
             _, topk_idx = torch.topk(scores_b, k)
@@ -848,11 +848,11 @@ class LightningModule(lightning.LightningModule):
             valid[topk_idx] = True
             
             # 🔥 VERY IMPORTANT: lower threshold for stuff classes
-            valid = valid & (scores_b > 0.15)
+            valid = valid & (scores_b > 0.1)
             
             # 🔥 fallback (SAFE)
             if valid.sum() < 30:
-                fallback_k = min(80, scores_b.shape[0])
+                fallback_k = min(100, scores_b.shape[0])
                 _, fallback_idx = torch.topk(scores_b, fallback_k)
                 valid = torch.zeros_like(scores_b, dtype=torch.bool)
                 valid[fallback_idx] = True
