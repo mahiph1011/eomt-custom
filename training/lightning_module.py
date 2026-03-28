@@ -201,18 +201,18 @@ class LightningModule(lightning.LightningModule):
         mask_logits_per_block, class_logits_per_block = self(imgs) 
 
         #  APPLIED IMPROVEMENT BLOCK-WISE
-        new_mask_logits_per_block = []
-        new_class_logits_per_block = []
+        # new_mask_logits_per_block = []
+        # new_class_logits_per_block = []
         
-        for mask_logits, class_logits in zip(mask_logits_per_block, class_logits_per_block):
-            mask_logits, class_logits = improve_eomt_outputs(
-                mask_logits, class_logits, conf_thresh=0.6, temperature=0.7
-            )
-            new_mask_logits_per_block.append(mask_logits)
-            new_class_logits_per_block.append(class_logits)
+        # for mask_logits, class_logits in zip(mask_logits_per_block, class_logits_per_block):
+        #     mask_logits, class_logits = improve_eomt_outputs(
+        #         mask_logits, class_logits, conf_thresh=0.6, temperature=0.7
+        #     )
+        #     new_mask_logits_per_block.append(mask_logits)
+        #     new_class_logits_per_block.append(class_logits)
         
-        mask_logits_per_block = new_mask_logits_per_block
-        class_logits_per_block = new_class_logits_per_block
+        # mask_logits_per_block = new_mask_logits_per_block
+        # class_logits_per_block = new_class_logits_per_block
 
         
 
@@ -811,7 +811,24 @@ class LightningModule(lightning.LightningModule):
     def to_per_pixel_preds_panoptic(
         self, mask_logits_list, class_logits, stuff_classes, mask_thresh, overlap_thresh
     ):
-        scores, classes = class_logits.softmax(dim=-1).max(-1)
+        scores, classes = class_logits.softmax(dim=-1).max(-1)   
+
+        
+        #  NEW: GLOBAL CONFIDENCE PRUNING
+        conf_thresh = scores.mean().item()
+        
+        keep_global = scores > conf_thresh
+        if keep_global.sum() == 0:
+            keep_global = scores > 0.3
+        
+        # Apply pruning
+        class_logits = class_logits[:, keep_global]
+        mask_logits_list = [m[:, keep_global] for m in mask_logits_list]
+        scores = scores[:, keep_global]
+        classes = classes[:, keep_global]
+        
+        print("🔥 PANOPTIC PRUNING ACTIVE")  # debug
+        
         preds_list = []
 
         for i in range(len(mask_logits_list)):
@@ -827,7 +844,7 @@ class LightningModule(lightning.LightningModule):
                 preds_list.append(preds)
                 continue
 
-            masks = mask_logits_list[i].sigmoid()
+            masks = (mask_logits_list[i] / 0.7).sigmoid()
             segments = -torch.ones(
                 *masks.shape[-2:],
                 dtype=torch.long,
