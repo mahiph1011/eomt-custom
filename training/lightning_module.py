@@ -39,7 +39,7 @@ from training.two_stage_warmup_poly_schedule import TwoStageWarmupPolySchedule
 bold_green = "\033[1;32m"
 reset = "\033[0m"
 
-def improve_eomt_outputs(mask_logits, class_logits, conf_thresh=confidence.mean().item(), temperature=0.7):
+def improve_eomt_outputs(mask_logits, class_logits, conf_thresh=0.6, temperature=0.7):
     """
     mask_logits: (Q, H, W)
     class_logits: (Q, C)
@@ -48,7 +48,7 @@ def improve_eomt_outputs(mask_logits, class_logits, conf_thresh=confidence.mean(
     # Confidence pruning
     probs = torch.softmax(class_logits, dim=-1)
     confidence, _ = probs.max(dim=-1)
-
+    conf_thresh = confidence.mean().item() #adaptive thresholding 
     keep = confidence > conf_thresh
     if keep.sum() == 0:
         keep = confidence > 0.3
