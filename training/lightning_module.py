@@ -39,6 +39,28 @@ from training.two_stage_warmup_poly_schedule import TwoStageWarmupPolySchedule
 bold_green = "\033[1;32m"
 reset = "\033[0m"
 
+def improve_eomt_outputs(mask_logits, class_logits, conf_thresh=confidence.mean().item(), temperature=0.7):
+    """
+    mask_logits: (Q, H, W)
+    class_logits: (Q, C)
+    """
+
+    # Confidence pruning
+    probs = torch.softmax(class_logits, dim=-1)
+    confidence, _ = probs.max(dim=-1)
+
+    keep = confidence > conf_thresh
+    if keep.sum() == 0:
+        keep = confidence > 0.3
+
+    mask_logits = mask_logits[keep]
+    class_logits = class_logits[keep]
+
+    # Mask sharpening
+    mask_logits = mask_logits / temperature
+
+    return mask_logits, class_logits
+
 
 class LightningModule(lightning.LightningModule):
     def __init__(
@@ -176,7 +198,23 @@ class LightningModule(lightning.LightningModule):
     def training_step(self, batch, batch_idx):
         imgs, targets = batch
 
-        mask_logits_per_block, class_logits_per_block = self(imgs)
+        mask_logits_per_block, class_logits_per_block = self(imgs) 
+
+        #  APPLIED IMPROVEMENT BLOCK-WISE
+        new_mask_logits_per_block = []
+        new_class_logits_per_block = []
+        
+        for mask_logits, class_logits in zip(mask_logits_per_block, class_logits_per_block):
+            mask_logits, class_logits = improve_eomt_outputs(
+                mask_logits, class_logits, conf_thresh=0.6, temperature=0.7
+            )
+            new_mask_logits_per_block.append(mask_logits)
+            new_class_logits_per_block.append(class_logits)
+        
+        mask_logits_per_block = new_mask_logits_per_block
+        class_logits_per_block = new_class_logits_per_block
+
+        
 
         losses_all_blocks = {}
         for i, (mask_logits, class_logits) in enumerate(
@@ -665,14 +703,40 @@ class LightningModule(lightning.LightningModule):
         ]
 
     @staticmethod
+    # def to_per_pixel_logits_semantic(
+    #     mask_logits: torch.Tensor, class_logits: torch.Tensor
+    # ):
+    #     return torch.einsum(
+    #         "bqhw, bqc -> bchw",
+    #         mask_logits.sigmoid(),
+    #         class_logits.softmax(dim=-1)[..., :-1],
+    #     )
+
     def to_per_pixel_logits_semantic(
         mask_logits: torch.Tensor, class_logits: torch.Tensor
     ):
+        # 🔥 Confidence pruning
+        probs = torch.softmax(class_logits, dim=-1)
+        confidence, _ = probs.max(dim=-1)
+    
+        keep = confidence > confidence.mean()
+        if keep.sum() == 0:
+            keep = confidence > 0.3
+    
+        mask_logits = mask_logits[:, keep]
+        class_logits = class_logits[:, keep]
+    
+        # 🔥 Mask sharpening
+        mask_logits = mask_logits / 0.7
+    
         return torch.einsum(
             "bqhw, bqc -> bchw",
             mask_logits.sigmoid(),
             class_logits.softmax(dim=-1)[..., :-1],
         )
+
+
+    
 
     @staticmethod
     @torch.compiler.disable
