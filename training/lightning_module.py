@@ -809,88 +809,182 @@ class LightningModule(lightning.LightningModule):
         return logits
 
     def to_per_pixel_preds_panoptic(
-        self, mask_logits_list, class_logits, stuff_classes, mask_thresh, overlap_thresh
+    self, mask_logits_list, class_logits, stuff_classes, mask_thresh, overlap_thresh
     ):
-        scores, classes = class_logits.softmax(dim=-1).max(-1)   
+    scores, classes = class_logits.softmax(dim=-1).max(-1)
 
-        
-        #  NEW: GLOBAL CONFIDENCE PRUNING
-        conf_thresh = scores.mean().item()
-        
-        keep_global = scores > conf_thresh
-        if keep_global.sum() == 0:
-            keep_global = scores > 0.3
-        
-        # Apply pruning
-        class_logits = class_logits[:, keep_global]
-        mask_logits_list = [m[:, keep_global] for m in mask_logits_list]
-        scores = scores[:, keep_global]
-        classes = classes[:, keep_global]
-        
-        print("🔥 PANOPTIC PRUNING ACTIVE")  # debug
-        
-        preds_list = []
+    print("🔥 PANOPTIC PRUNING ACTIVE")
 
-        for i in range(len(mask_logits_list)):
-            preds = -torch.ones(
-                (*mask_logits_list[i].shape[-2:], 2),
-                dtype=torch.long,
-                device=class_logits.device,
-            )
-            preds[:, :, 0] = self.num_classes
+    preds_list = []
 
-            keep = classes[i].ne(class_logits.shape[-1] - 1) & (scores[i] > mask_thresh)
-            if not keep.any():
-                preds_list.append(preds)
+    B = class_logits.shape[0]
+
+    for b in range(B):  # 🔥 process per batch
+        scores_b = scores[b]
+        classes_b = classes[b]
+        class_logits_b = class_logits[b]
+        mask_logits_list_b = [m[b] for m in mask_logits_list]
+
+        # 🔥 confidence pruning (per image)
+        conf_thresh = scores_b.mean().item()
+        keep = scores_b > conf_thresh
+
+        if keep.sum() == 0:
+            keep = scores_b > 0.3
+
+        # apply pruning
+        scores_b = scores_b[keep]
+        classes_b = classes_b[keep]
+        class_logits_b = class_logits_b[keep]
+        mask_logits_list_b = [m[keep] for m in mask_logits_list_b]
+
+        # create prediction map
+        preds = -torch.ones(
+            (*mask_logits_list_b[0].shape[-2:], 2),
+            dtype=torch.long,
+            device=class_logits.device,
+        )
+        preds[:, :, 0] = self.num_classes
+
+        # filter valid queries
+        valid = classes_b.ne(class_logits.shape[-1] - 1) & (scores_b > mask_thresh)
+        if not valid.any():
+            preds_list.append(preds)
+            continue
+
+        # 🔥 mask sharpening
+        masks = (mask_logits_list_b[0] / 0.7).sigmoid()
+
+        segments = -torch.ones(
+            *masks.shape[-2:], dtype=torch.long, device=class_logits.device
+        )
+
+        mask_ids = (scores_b[valid][..., None, None] * masks[valid]).argmax(0)
+
+        stuff_segment_ids = {}
+        segment_id = 0
+        segment_and_class_ids = []
+
+        for k, class_id in enumerate(classes_b[valid].tolist()):
+            orig_mask = masks[valid][k] >= 0.5
+            new_mask = mask_ids == k
+            final_mask = orig_mask & new_mask
+
+            orig_area = orig_mask.sum().item()
+            new_area = new_mask.sum().item()
+            final_area = final_mask.sum().item()
+
+            if (
+                orig_area == 0
+                or new_area == 0
+                or final_area == 0
+                or new_area / orig_area < overlap_thresh
+            ):
                 continue
 
-            masks = (mask_logits_list[i] / 0.7).sigmoid()
-            segments = -torch.ones(
-                *masks.shape[-2:],
-                dtype=torch.long,
-                device=class_logits.device,
-            )
-
-            mask_ids = (scores[i][keep][..., None, None] * masks[keep]).argmax(0)
-            stuff_segment_ids, segment_id = {}, 0
-            segment_and_class_ids = []
-
-            for k, class_id in enumerate(classes[i][keep].tolist()):
-                orig_mask = masks[keep][k] >= 0.5
-                new_mask = mask_ids == k
-                final_mask = orig_mask & new_mask
-
-                orig_area = orig_mask.sum().item()
-                new_area = new_mask.sum().item()
-                final_area = final_mask.sum().item()
-                if (
-                    orig_area == 0
-                    or new_area == 0
-                    or final_area == 0
-                    or new_area / orig_area < overlap_thresh
-                ):
+            if class_id in stuff_classes:
+                if class_id in stuff_segment_ids:
+                    segments[final_mask] = stuff_segment_ids[class_id]
                     continue
+                else:
+                    stuff_segment_ids[class_id] = segment_id
 
-                if class_id in stuff_classes:
-                    if class_id in stuff_segment_ids:
-                        segments[final_mask] = stuff_segment_ids[class_id]
-                        continue
-                    else:
-                        stuff_segment_ids[class_id] = segment_id
+            segments[final_mask] = segment_id
+            segment_and_class_ids.append((segment_id, class_id))
+            segment_id += 1
 
-                segments[final_mask] = segment_id
-                segment_and_class_ids.append((segment_id, class_id))
+        for segment_id, class_id in segment_and_class_ids:
+            segment_mask = segments == segment_id
+            preds[:, :, 0] = torch.where(segment_mask, class_id, preds[:, :, 0])
+            preds[:, :, 1] = torch.where(segment_mask, segment_id, preds[:, :, 1])
 
-                segment_id += 1
+        preds_list.append(preds)
 
-            for segment_id, class_id in segment_and_class_ids:
-                segment_mask = segments == segment_id
-                preds[:, :, 0] = torch.where(segment_mask, class_id, preds[:, :, 0])
-                preds[:, :, 1] = torch.where(segment_mask, segment_id, preds[:, :, 1])
+    return preds_list
 
-            preds_list.append(preds)
+    # def to_per_pixel_preds_panoptic(
+    #     self, mask_logits_list, class_logits, stuff_classes, mask_thresh, overlap_thresh
+    # ):
+    #     scores, classes = class_logits.softmax(dim=-1).max(-1)   
 
-        return preds_list
+        
+    #     #  NEW: GLOBAL CONFIDENCE PRUNING
+    #     conf_thresh = scores.mean().item()
+        
+    #     keep_global = scores > conf_thresh
+    #     if keep_global.sum() == 0:
+    #         keep_global = scores > 0.3
+        
+    #     # Apply pruning
+    #     class_logits = class_logits[:, keep_global]
+    #     mask_logits_list = [m[:, keep_global] for m in mask_logits_list]
+    #     scores = scores[:, keep_global]
+    #     classes = classes[:, keep_global]
+        
+    #     print("🔥 PANOPTIC PRUNING ACTIVE")  # debug
+        
+    #     preds_list = []
+
+    #     for i in range(len(mask_logits_list)):
+    #         preds = -torch.ones(
+    #             (*mask_logits_list[i].shape[-2:], 2),
+    #             dtype=torch.long,
+    #             device=class_logits.device,
+    #         )
+    #         preds[:, :, 0] = self.num_classes
+
+    #         keep = classes[i].ne(class_logits.shape[-1] - 1) & (scores[i] > mask_thresh)
+    #         if not keep.any():
+    #             preds_list.append(preds)
+    #             continue
+
+    #         masks = (mask_logits_list[i] / 0.7).sigmoid()
+    #         segments = -torch.ones(
+    #             *masks.shape[-2:],
+    #             dtype=torch.long,
+    #             device=class_logits.device,
+    #         )
+
+    #         mask_ids = (scores[i][keep][..., None, None] * masks[keep]).argmax(0)
+    #         stuff_segment_ids, segment_id = {}, 0
+    #         segment_and_class_ids = []
+
+    #         for k, class_id in enumerate(classes[i][keep].tolist()):
+    #             orig_mask = masks[keep][k] >= 0.5
+    #             new_mask = mask_ids == k
+    #             final_mask = orig_mask & new_mask
+
+    #             orig_area = orig_mask.sum().item()
+    #             new_area = new_mask.sum().item()
+    #             final_area = final_mask.sum().item()
+    #             if (
+    #                 orig_area == 0
+    #                 or new_area == 0
+    #                 or final_area == 0
+    #                 or new_area / orig_area < overlap_thresh
+    #             ):
+    #                 continue
+
+    #             if class_id in stuff_classes:
+    #                 if class_id in stuff_segment_ids:
+    #                     segments[final_mask] = stuff_segment_ids[class_id]
+    #                     continue
+    #                 else:
+    #                     stuff_segment_ids[class_id] = segment_id
+
+    #             segments[final_mask] = segment_id
+    #             segment_and_class_ids.append((segment_id, class_id))
+
+    #             segment_id += 1
+
+    #         for segment_id, class_id in segment_and_class_ids:
+    #             segment_mask = segments == segment_id
+    #             preds[:, :, 0] = torch.where(segment_mask, class_id, preds[:, :, 0])
+    #             preds[:, :, 1] = torch.where(segment_mask, segment_id, preds[:, :, 1])
+
+    #         preds_list.append(preds)
+
+    #     return preds_list
 
     @staticmethod
     @torch.compiler.disable
