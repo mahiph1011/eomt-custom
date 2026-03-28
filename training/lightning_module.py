@@ -837,16 +837,25 @@ class LightningModule(lightning.LightningModule):
             # FINAL: SOFT PRUNING (BEST FOR PQ)
 
             # Step 1: keep top queries (not too aggressive)
-            topk = 150   # IMPORTANT: keep more queries
+            # ===== FINAL BEST SETTINGS =====
+
+            topk = 180   # 🔥 increase coverage
             k = min(topk, scores_b.shape[0])
             
-            topk_scores, topk_idx = torch.topk(scores_b, k)
+            _, topk_idx = torch.topk(scores_b, k)
             
             valid = torch.zeros_like(scores_b, dtype=torch.bool)
             valid[topk_idx] = True
             
-            # Step 2: remove only VERY low confidence (not aggressive)
-            valid = valid & (scores_b > 0.2)
+            # 🔥 VERY IMPORTANT: lower threshold for stuff classes
+            valid = valid & (scores_b > 0.15)
+            
+            # 🔥 fallback (SAFE)
+            if valid.sum() < 30:
+                fallback_k = min(80, scores_b.shape[0])
+                _, fallback_idx = torch.topk(scores_b, fallback_k)
+                valid = torch.zeros_like(scores_b, dtype=torch.bool)
+                valid[fallback_idx] = True
 
 
             
@@ -866,13 +875,13 @@ class LightningModule(lightning.LightningModule):
             # if valid.sum() == 0:
             #     valid = scores_b > 0.3
 
-            if valid.sum() == 0:
-                # fallback: keep top 50 queries (safe)
-                topk_fallback = min(50, scores_b.shape[0])
-                _, fallback_idx = torch.topk(scores_b, topk_fallback)
+            # if valid.sum() == 0:
+            #     # fallback: keep top 50 queries (safe)
+            #     topk_fallback = min(50, scores_b.shape[0])
+            #     _, fallback_idx = torch.topk(scores_b, topk_fallback)
             
-                valid = torch.zeros_like(scores_b, dtype=torch.bool)
-                valid[fallback_idx] = True
+            #     valid = torch.zeros_like(scores_b, dtype=torch.bool)
+            #     valid[fallback_idx] = True
 
 
     
@@ -891,7 +900,8 @@ class LightningModule(lightning.LightningModule):
                 continue
     
             # 🔥 mask sharpening (SAFE)
-            masks = (mask_logits_b / 1.0).sigmoid()
+            # masks = (mask_logits_b / 1.0).sigmoid()
+            masks = mask_logits_b.sigmoid()
     
             segments = -torch.ones(
                 *masks.shape[-2:], dtype=torch.long, device=class_logits.device
