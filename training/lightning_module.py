@@ -711,23 +711,22 @@ class LightningModule(lightning.LightningModule):
     #         mask_logits.sigmoid(),
     #         class_logits.softmax(dim=-1)[..., :-1],
     #     )
-
     def to_per_pixel_logits_semantic(
         mask_logits: torch.Tensor, class_logits: torch.Tensor
     ):
-        # 🔥 Confidence pruning
+        # 🔥 SAFE confidence pruning (very mild)
         probs = torch.softmax(class_logits, dim=-1)
         confidence, _ = probs.max(dim=-1)
     
-        keep = confidence > confidence.mean()
+        keep = confidence > confidence.mean() * 0.5  # softer threshold
         if keep.sum() == 0:
-            keep = confidence > 0.3
+            keep = confidence > 0.2
     
         mask_logits = mask_logits[:, keep]
         class_logits = class_logits[:, keep]
     
-        # 🔥 Mask sharpening
-        mask_logits = mask_logits / 0.7
+        # 🔥 SAFE mask sharpening (NOT aggressive)
+        mask_logits = mask_logits / 1.1
     
         return torch.einsum(
             "bqhw, bqc -> bchw",
@@ -735,7 +734,7 @@ class LightningModule(lightning.LightningModule):
             class_logits.softmax(dim=-1)[..., :-1],
         )
 
-
+   
     
 
     @staticmethod
@@ -811,30 +810,29 @@ class LightningModule(lightning.LightningModule):
 
 
 
-
-
-
     def to_per_pixel_preds_panoptic(
         self, mask_logits_list, class_logits, stuff_classes, mask_thresh, overlap_thresh
     ):
         scores, classes = class_logits.softmax(dim=-1).max(-1)
     
-        # 🔥 Temperature scaling (your novelty)
-        temperature = 0.7
-        scores = scores ** (1 / temperature)
-    
         preds_list = []
         B = class_logits.shape[0]
     
         for b in range(B):
-            if b == 0:
-                print("🔥 Temperature-scaled inference enabled")
     
             scores_b = scores[b]
             classes_b = classes[b]
             mask_logits_b = mask_logits_list[b]
     
-            # 🔥 initialize preds INSIDE loop
+            # 🔥 SAFE masks (no aggressive scaling)
+            masks = mask_logits_b.sigmoid()
+    
+            # 🔥 NEW: mask confidence (KEY IMPROVEMENT)
+            mask_confidence = masks.mean(dim=(-1, -2))  # [Q]
+    
+            # 🔥 combine classification + mask quality
+            combined_scores = scores_b * (0.7 + 0.3 * mask_confidence)
+    
             preds = -torch.ones(
                 (*mask_logits_b.shape[-2:], 2),
                 dtype=torch.long,
@@ -842,22 +840,19 @@ class LightningModule(lightning.LightningModule):
             )
             preds[:, :, 0] = self.num_classes
     
-            # valid queries
+            # 🔥 VALID FILTER (safe)
             valid = classes_b.ne(class_logits.shape[-1] - 1) & (scores_b > mask_thresh)
     
             if not valid.any():
                 preds_list.append(preds)
                 continue
     
-            # 🔥 mask scaling (safe)
-            masks = (mask_logits_b * 1.1).sigmoid()
-    
             segments = -torch.ones(
                 *masks.shape[-2:], dtype=torch.long, device=class_logits.device
             )
     
-            # 🔥 IMPORTANT: use ALL queries (no slicing here)
-            mask_ids = (scores_b[..., None, None] * masks).argmax(0)
+            # 🔥 KEY CHANGE HERE
+            mask_ids = (combined_scores[..., None, None] * masks).argmax(0)
     
             stuff_segment_ids = {}
             segment_id = 0
@@ -893,7 +888,6 @@ class LightningModule(lightning.LightningModule):
                 segment_and_class_ids.append((segment_id, class_id))
                 segment_id += 1
     
-            # 🔥 apply segments (INSIDE LOOP)
             for seg_id, class_id in segment_and_class_ids:
                 segment_mask = segments == seg_id
                 preds[:, :, 0] = torch.where(segment_mask, class_id, preds[:, :, 0])
@@ -902,6 +896,11 @@ class LightningModule(lightning.LightningModule):
             preds_list.append(preds)
     
         return preds_list
+
+
+
+
+
 
 
 
