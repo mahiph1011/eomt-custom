@@ -711,22 +711,23 @@ class LightningModule(lightning.LightningModule):
     #         mask_logits.sigmoid(),
     #         class_logits.softmax(dim=-1)[..., :-1],
     #     )
+
     def to_per_pixel_logits_semantic(
         mask_logits: torch.Tensor, class_logits: torch.Tensor
     ):
-        # 🔥 SAFE confidence pruning (very mild)
+        # 🔥 Confidence pruning
         probs = torch.softmax(class_logits, dim=-1)
         confidence, _ = probs.max(dim=-1)
     
-        keep = confidence > confidence.mean() * 0.5  # softer threshold
+        keep = confidence > confidence.mean()
         if keep.sum() == 0:
-            keep = confidence > 0.2
+            keep = confidence > 0.3
     
         mask_logits = mask_logits[:, keep]
         class_logits = class_logits[:, keep]
     
-        # 🔥 SAFE mask sharpening (NOT aggressive)
-        mask_logits = mask_logits / 1.1
+        # 🔥 Mask sharpening
+        mask_logits = mask_logits / 0.7
     
         return torch.einsum(
             "bqhw, bqc -> bchw",
@@ -734,7 +735,7 @@ class LightningModule(lightning.LightningModule):
             class_logits.softmax(dim=-1)[..., :-1],
         )
 
-   
+
     
 
     @staticmethod
@@ -810,28 +811,82 @@ class LightningModule(lightning.LightningModule):
 
 
 
+
     def to_per_pixel_preds_panoptic(
         self, mask_logits_list, class_logits, stuff_classes, mask_thresh, overlap_thresh
     ):
         scores, classes = class_logits.softmax(dim=-1).max(-1)
     
+        
+        print("🔥 Adaptive pruning enabled")
+    
         preds_list = []
+    
         B = class_logits.shape[0]
     
         for b in range(B):
-    
             scores_b = scores[b]
             classes_b = classes[b]
             mask_logits_b = mask_logits_list[b]
     
-            # 🔥 SAFE masks (no aggressive scaling)
-            masks = mask_logits_b.sigmoid()
+            # 🔥 ONLY MODIFY VALID FILTER (NO TENSOR SLICING)
+            # conf_thresh = scores_b.mean().item()
+            # valid = (scores_b > conf_thresh)
+
+
+            # FINAL: SOFT PRUNING (BEST FOR PQ)
+
+            # Step 1: keep top queries (not too aggressive)
+            # ===== FINAL BEST SETTINGS =====
+
+            topk = 220  # 🔥 increase coverage
+            k = min(topk, scores_b.shape[0])
+            
+            _, topk_idx = torch.topk(scores_b, k)
+            
+            valid = torch.zeros_like(scores_b, dtype=torch.bool)
+            valid[topk_idx] = True
+            
+            # 🔥 VERY IMPORTANT: lower threshold for stuff classes
+            valid = valid & (scores_b > 0.08)
+            
+            # 🔥 fallback (SAFE)
+            if valid.sum() < 50:
+                fallback_k = min(120, scores_b.shape[0])
+                _, fallback_idx = torch.topk(scores_b, fallback_k)
+                valid = torch.zeros_like(scores_b, dtype=torch.bool)
+                valid[fallback_idx] = True
+
+
+            
+
+            # #  TOP-K + SAFE THRESHOLD
+            # topk = 100   # try 80–120 if needed
+            # k = min(topk, scores_b.shape[0])
+            
+            # topk_scores, topk_idx = torch.topk(scores_b, k)
+            
+            # valid = torch.zeros_like(scores_b, dtype=torch.bool)
+            # valid[topk_idx] = True
+            
+            # # also ensure confidence floor
+            # valid = valid & (scores_b > 0.4)
+            # fallback
+            # if valid.sum() == 0:
+            #     valid = scores_b > 0.3
+
+            # if valid.sum() == 0:
+            #     # fallback: keep top 50 queries (safe)
+            #     topk_fallback = min(50, scores_b.shape[0])
+            #     _, fallback_idx = torch.topk(scores_b, topk_fallback)
+            
+            #     valid = torch.zeros_like(scores_b, dtype=torch.bool)
+            #     valid[fallback_idx] = True
+
+
     
-            # 🔥 NEW: mask confidence (KEY IMPROVEMENT)
-            mask_confidence = masks.mean(dim=(-1, -2))  # [Q]
-    
-            # 🔥 combine classification + mask quality
-            combined_scores = scores_b * (0.7 + 0.3 * mask_confidence)
+            # combine with original condition
+            valid = valid & classes_b.ne(class_logits.shape[-1] - 1) & (scores_b > mask_thresh)
     
             preds = -torch.ones(
                 (*mask_logits_b.shape[-2:], 2),
@@ -840,19 +895,19 @@ class LightningModule(lightning.LightningModule):
             )
             preds[:, :, 0] = self.num_classes
     
-            # 🔥 VALID FILTER (safe)
-            valid = classes_b.ne(class_logits.shape[-1] - 1) & (scores_b > mask_thresh)
-    
             if not valid.any():
                 preds_list.append(preds)
                 continue
+    
+            # 🔥 mask sharpening (SAFE)
+            # masks = (mask_logits_b / 1.0).sigmoid()
+            masks = mask_logits_b.sigmoid()
     
             segments = -torch.ones(
                 *masks.shape[-2:], dtype=torch.long, device=class_logits.device
             )
     
-            # 🔥 KEY CHANGE HERE
-            mask_ids = (combined_scores[..., None, None] * masks).argmax(0)
+            mask_ids = (scores_b[valid][..., None, None] * masks[valid]).argmax(0)
     
             stuff_segment_ids = {}
             segment_id = 0
@@ -888,234 +943,14 @@ class LightningModule(lightning.LightningModule):
                 segment_and_class_ids.append((segment_id, class_id))
                 segment_id += 1
     
-            for seg_id, class_id in segment_and_class_ids:
-                segment_mask = segments == seg_id
+            for segment_id, class_id in segment_and_class_ids:
+                segment_mask = segments == segment_id
                 preds[:, :, 0] = torch.where(segment_mask, class_id, preds[:, :, 0])
-                preds[:, :, 1] = torch.where(segment_mask, seg_id, preds[:, :, 1])
+                preds[:, :, 1] = torch.where(segment_mask, segment_id, preds[:, :, 1])
     
             preds_list.append(preds)
     
         return preds_list
-
-
-
-
-
-
-
-
-
-
-    # def to_per_pixel_preds_panoptic(
-    #     self, mask_logits_list, class_logits, stuff_classes, mask_thresh, overlap_thresh
-    # ):
-    #     scores, classes = class_logits.softmax(dim=-1).max(-1)
-    #     # 🔥 NEW: Temperature scaling on scores (KEY NOVELTY)
-    #     temperature = 0.7   # try 0.6–0.8 if needed
-    #     scores = scores ** (1 / temperature)
-    
-        
-        
-    
-    #     preds_list = []
-    
-    #     B = class_logits.shape[0]
-
-    
-    #     for b in range(B):
-    #         if b == 0:
-    #             print("🔥 Temperature-scaled inference enabled")
-                
-    #         scores_b = scores[b]
-    #         classes_b = classes[b]
-    #         mask_logits_b = mask_logits_list[b]
-    
-    #         # 🔥 ONLY MODIFY VALID FILTER (NO TENSOR SLICING)
-    #         # conf_thresh = scores_b.mean().item()
-    #         # valid = (scores_b > conf_thresh)
-
-
-    #         # FINAL: SOFT PRUNING (BEST FOR PQ)
-
-    #         # Step 1: keep top queries (not too aggressive)
-    #         # ===== FINAL BEST SETTINGS =====
-
-    #         # topk = 240  # 🔥 increase coverage
-    #         # k = min(topk, scores_b.shape[0])
-            
-    #         # _, topk_idx = torch.topk(scores_b, k)
-            
-    #         # valid = torch.zeros_like(scores_b, dtype=torch.bool)
-    #         # valid[topk_idx] = True
-            
-    #         # # 🔥 VERY IMPORTANT: lower threshold for stuff classes
-    #         # valid = valid & (scores_b > 0.05)
-            
-    #         # # 🔥 fallback (SAFE)
-    #         # if valid.sum() < 50:
-    #         #     fallback_k = min(140, scores_b.shape[0])
-    #         #     _, fallback_idx = torch.topk(scores_b, fallback_k)
-    #         #     valid = torch.zeros_like(scores_b, dtype=torch.bool)
-    #         #     valid[fallback_idx] = True
-
-
-            
-
-    #         # #  TOP-K + SAFE THRESHOLD
-    #         # topk = 100   # try 80–120 if needed
-    #         # k = min(topk, scores_b.shape[0])
-            
-    #         # topk_scores, topk_idx = torch.topk(scores_b, k)
-            
-    #         # valid = torch.zeros_like(scores_b, dtype=torch.bool)
-    #         # valid[topk_idx] = True
-            
-    #         # # also ensure confidence floor
-    #         # valid = valid & (scores_b > 0.4)
-    #         # fallback
-    #         # if valid.sum() == 0:
-    #         #     valid = scores_b > 0.3
-
-    #         # if valid.sum() == 0:
-    #         #     # fallback: keep top 50 queries (safe)
-    #         #     topk_fallback = min(50, scores_b.shape[0])
-    #         #     _, fallback_idx = torch.topk(scores_b, topk_fallback)
-            
-    #         #     valid = torch.zeros_like(scores_b, dtype=torch.bool)
-    #         #     valid[fallback_idx] = True
-
-
-    
-    #         # combine with original condition
-    #         # valid = valid & classes_b.ne(class_logits.shape[-1] - 1) & (scores_b > mask_thresh)
-    
-    #         # preds = -torch.ones(
-    #         #     (*mask_logits_b.shape[-2:], 2),
-    #         #     dtype=torch.long,
-    #         #     device=class_logits.device,
-    #         # )
-    #         # preds[:, :, 0] = self.num_classes
-    
-    #         # if not valid.any():
-    #         #     preds_list.append(preds)
-    #         #     continue
-    
-    #         # 🔥 mask sharpening (SAFE)
-    #         # masks = (mask_logits_b / 1.0).sigmoid()
-    #         # masks = mask_logits_b.sigmoid()
-    #         # masks = (mask_logits_b * 1.2).sigmoid()
-    
-    #         # segments = -torch.ones(
-    #         #     *masks.shape[-2:], dtype=torch.long, device=class_logits.device
-    #         # )
-    
-    #         # mask_ids = (scores_b[..., None, None] * masks).argmax(0)
-    
-    #         # stuff_segment_ids = {}
-    #         # segment_id = 0
-    #         # segment_and_class_ids = []
-    
-    #         # valid_classes = classes_b[valid]
-
-
-
-
-
-
-    
-    #         # for k, class_id in enumerate(valid_classes.tolist()):
-    #         #     orig_mask = masks[valid][k] >= 0.5
-    #         #     new_mask = mask_ids == k
-    #         #     final_mask = orig_mask & new_mask
-    
-    #         #     orig_area = orig_mask.sum().item()
-    #         #     new_area = new_mask.sum().item()
-    #         #     final_area = final_mask.sum().item()
-    
-    #         #     if (
-    #         #         orig_area == 0
-    #         #         or new_area == 0
-    #         #         or final_area == 0
-    #         #         or new_area / orig_area < overlap_thresh
-    #         #     ):
-    #         #         continue
-    
-    #         #     if class_id in stuff_classes:
-    #         #         if class_id in stuff_segment_ids:
-    #         #             segments[final_mask] = stuff_segment_ids[class_id]
-    #         #             continue
-    #         #         else:
-    #         #             stuff_segment_ids[class_id] = segment_id
-    
-    #         #     segments[final_mask] = segment_id
-    #         #     segment_and_class_ids.append((segment_id, class_id))
-    #         #     segment_id += 1
-
-    #         # 🔥 USE ALL QUERIES (NO PRUNING)
-    #         valid = classes_b.ne(class_logits.shape[-1] - 1) & (scores_b > mask_thresh)
-            
-    #         if not valid.any():
-    #             preds_list.append(preds)
-    #             continue
-            
-    #         # 🔥 SAFE mask scaling
-    #         masks = (mask_logits_b * 1.1).sigmoid()
-            
-    #         segments = -torch.ones(
-    #             *masks.shape[-2:], dtype=torch.long, device=class_logits.device
-    #         )
-            
-    #         # 🔥 USE ALL QUERIES (NO slicing)
-    #         mask_ids = (scores_b[..., None, None] * masks).argmax(0)
-        
-    #         stuff_segment_ids = {}
-    #         segment_id = 0
-    #         segment_and_class_ids = []
-            
-    #         valid_classes = classes_b[valid]
-            
-    #         for k, class_id in enumerate(valid_classes.tolist()):
-    #             orig_mask = masks[valid][k] >= 0.5
-    #             new_mask = mask_ids == k
-    #             final_mask = orig_mask & new_mask
-            
-    #             orig_area = orig_mask.sum().item()
-    #             new_area = new_mask.sum().item()
-    #             final_area = final_mask.sum().item()
-            
-    #             if (
-    #                 orig_area == 0
-    #                 or new_area == 0
-    #                 or final_area == 0
-    #                 or new_area / orig_area < overlap_thresh
-    #             ):
-    #                 continue
-            
-    #             if class_id in stuff_classes:
-    #                 if class_id in stuff_segment_ids:
-    #                     segments[final_mask] = stuff_segment_ids[class_id]
-    #                     continue
-    #                 else:
-    #                     stuff_segment_ids[class_id] = segment_id
-        
-    #             segments[final_mask] = segment_id
-    #             segment_and_class_ids.append((segment_id, class_id))
-    #             segment_id += 1
-
-
-
-
-
-
-    
-    #         for segment_id, class_id in segment_and_class_ids:
-    #             segment_mask = segments == segment_id
-    #             preds[:, :, 0] = torch.where(segment_mask, class_id, preds[:, :, 0])
-    #             preds[:, :, 1] = torch.where(segment_mask, segment_id, preds[:, :, 1])
-    
-    #         preds_list.append(preds)
-    
-    #     return preds_list
    
  
 
