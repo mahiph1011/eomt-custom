@@ -10,7 +10,7 @@
 
 import math
 from typing import Optional, cast
-import ligfhtning
+import lightning
 from lightning.fabric.utilities import rank_zero_info
 import torch
 import torch.nn as nn
